@@ -6,233 +6,69 @@ import SwiftSyntaxMacroExpansion
 
 public struct InjectableMacro: MemberMacro {
     private struct Arguments {
-        var access: String = ""
-        var superInit: String?
-        var useSetup: Bool = false
+        var autoInit: Bool = false
     }
     
-    private struct VariableArguments {
-        var name: String?
-        var isEscaping: Bool = false
+    private class Dependencies {
+        var variables: String = ""
+        var initParameters: String = ""
+        var initAssignments: String = ""
+        
+        var isEmpty: Bool {
+            variables.isEmpty || initParameters.isEmpty || initAssignments.isEmpty
+        }
     }
     
-    private static let supportingKinds: Set<SyntaxKind> = [.classDecl, .structDecl]
+    // MARK: MemberMacro
     
     public static func expansion(
         of attribute: AttributeSyntax,
         providingMembersOf declaration: some DeclGroupSyntax,
         in context: some MacroExpansionContext
     ) throws -> [DeclSyntax] {
-        // Only `class` is suitable for this macro
-        guard supportingKinds.contains(declaration.kind) else {
-            return []
-        }
+        // Get access modifier for dependencies
+        let modifiers = MemberModifiers(modifiers: declaration.modifiers)
+        let access = modifiers.access == .open ? "public" : modifiers.access.rawValue
         
-        var parameters = [String]()
-        var assignments = [CodeBlockItemListSyntax.Element]()
-    
         // Check each member to find all `@Injected` properties
-        declaration.memberBlock.members.forEach { member in
-            guard
-                let variable = member.decl.as(VariableDeclSyntax.self),
-                let attribute = variable.attributes.first?.as(AttributeSyntax.self),
-                attribute.attributeName.as(IdentifierTypeSyntax.self)?.name.text == "Injected",
-                let bindings = variable.bindings.as(PatternBindingListSyntax.self),
-                let pattern = bindings.first?.as(PatternBindingSyntax.self),
-                let identifier = pattern.pattern.as(IdentifierPatternSyntax.self)?.identifier.text,
-                let type = pattern.typeAnnotation?.as(TypeAnnotationSyntax.self)?.type
-            else { return }
+        let dependencies = declaration.memberBlock.members.reduce(into: Dependencies()) { dependencies, member in
+            guard let variable = try? InjectedVariable(decl: member.decl) else { return }
             
-            // Get variable arguments given for this property
-            let variableArguments = getVariableArguments(attribute: attribute)
+            // Add a new variable and init assignment for `struct Dependencies`
+            let name = variable.arguments.name ?? variable.identifier
+            let isClosure = variable.arguments.isEscaping || variable.type.is(FunctionTypeSyntax.self)
             
-            // Parameter's name
-            let name = variableArguments.name ?? identifier
+            var variableString = "\(access) let \(name): \(variable.type)\n"
+            if dependencies.variables.isEmpty { variableString.insert("\n", at: variableString.startIndex) }
+            dependencies.variables.append(variableString)
             
-            // Define is `@escaping` parameter needed
-            let isClosure = variableArguments.isEscaping || type.is(FunctionTypeSyntax.self)
-            
-            parameters.append("\(name): \(isClosure ? "@escaping " : "")\(type)")
-            
-            let assignment = "\(assignments.isEmpty ? "" : "\n")self.\(identifier) = \(name)"
-            assignments.append("\(raw: assignment)")
-        }
-        
-        // Continue only when parameters isn't empty
-        guard !parameters.isEmpty, !assignments.isEmpty else {
-            return []
-        }
-        
-        // Get given arguments
-        let arguments = getArguments(attribute: attribute, modifiers: declaration.modifiers)
-        
-        // Append `super.init(...)` to assignments if the value existed
-        if let superInit = arguments.superInit {
-            assignments.append("\(raw: "\nsuper.init(\(superInit))")")
-        }
-        
-        // Append calling `setup()` method after `super.init()`
-        if arguments.useSetup {
-            assignments.append("\(raw: "\nsetup()")")
-        }
-        
-        // Prepare `init` header values
-        let initParameters = "\n\(parameters.joined(separator: ",\n"))\n"
-        let initModifierString = arguments.access.isEmpty ? "" : "\(arguments.access) "
-        
-        let initDeclSyntax = try InitializerDeclSyntax(
-            SyntaxNodeString(stringLiteral: "\(initModifierString)init(\(initParameters))"),
-            bodyBuilder: { .init(assignments) }
-        )
-        
-        return ["\(raw: initDeclSyntax)"]
-    }
-}
-
-// MARK: - Arguments
-
-extension InjectableMacro {
-    private static func modifyAccess(expression: ExprSyntax, arguments: inout Arguments) -> Bool {
-        guard let value = expression.as(MemberAccessExprSyntax.self)?.declName.baseName.text else { return false }
-        
-        switch value {
-        case "open":
-            arguments.access = "public"
-            
-        case "internal":
-            break
-            
-        default:
-            arguments.access = value // public, fileprivate, private has the same value
-        }
-        
-        return true
-    }
-    
-    private static func modifySuperInit(expression: ExprSyntax, arguments: inout Arguments) {
-        if let stringLiteral = expression.as(StringLiteralExprSyntax.self) {
-            // The value is string liter of custom
-            guard let segment = stringLiteral.segments.first.map(String.init) else { return }
-            arguments.superInit = segment
-        } else if let memberAccess = expression.as(MemberAccessExprSyntax.self) {
-            // Default empty string
-            switch memberAccess.declName.baseName.text {
-            case "default":
-                arguments.superInit = ""
-            default:
-                break
+            var initParameter = "\(name): \(isClosure ? "@escaping " : "")\(variable.type)"
+            if !dependencies.initParameters.isEmpty {
+                initParameter.insert(contentsOf: ",\n", at: initParameter.startIndex)
             }
-        }
-    }
-    
-    private static func modifyUseSetup(expression: ExprSyntax, arguments: inout Arguments) {
-        guard let value = expression.getBoolLiteral() else { return }
-        arguments.useSetup = value
-    }
-    
-    private static func getArguments(attribute: AttributeSyntax, modifiers: DeclModifierListSyntax) -> Arguments {
-        var arguments = Arguments()
-        
-        // Get list of arguments that given with `@Injectable(...)` attribute
-        guard let labeledList = attribute.arguments?.as(LabeledExprListSyntax.self) else {
-            return arguments
-        }
-        
-        var hasCustomAccess = false
-        
-        // Map each given attribute to modify arguments
-        labeledList.forEach { syntax in
-            switch syntax.label?.text {
-            case "access":
-                hasCustomAccess = modifyAccess(expression: syntax.expression, arguments: &arguments)
+            dependencies.initParameters.append(initParameter)
             
-            case "superInit":
-                modifySuperInit(expression: syntax.expression, arguments: &arguments)
-                
-            case "useSetup":
-                modifyUseSetup(expression: syntax.expression, arguments: &arguments)
-                
-            default:
-                break
+            var initAssignment = "self.\(name) = \(name)\n"
+            if dependencies.initAssignments.isEmpty {
+                initAssignment.insert("\n", at: initAssignment.startIndex)
             }
+            dependencies.initAssignments.append(initAssignment)
         }
         
-        // Get access level according to the given member's access modifier
-        if !hasCustomAccess {
-            for modifier in modifiers {
-                guard case .keyword(let keyword) = modifier.name.tokenKind else { continue }
-                
-                if keyword == .public || keyword == .open {
-                    arguments.access = "public"
-                    break
-                } else if keyword == .private {
-                    arguments.access = "private"
-                    break
-                } else if keyword == .fileprivate {
-                    arguments.access = "fileprivate"
-                    break
-                }
-            }
-        }
+        // Prepare blocks of generated codes if some variables existed
+        guard !dependencies.isEmpty else { return [] }
         
-        return arguments
-    }
-}
-
-// MARK: - Variable Arguments
-
-extension InjectableMacro {
-    private static func modifyVariableName(expression: ExprSyntax, arguments: inout VariableArguments) {
-        guard let stringLiteral = expression.as(StringLiteralExprSyntax.self) else { return }
-        arguments.name = stringLiteral.segments.first.map(String.init)
-    }
-    
-    private static func modifyVariableEscaping(expression: ExprSyntax, arguments: inout VariableArguments) {
-        guard let value = expression.getBoolLiteral() else { return }
-        arguments.isEscaping = value
-    }
-    
-    private static func getVariableArguments(attribute: AttributeSyntax) -> VariableArguments {
-        var arguments = VariableArguments()
+        // Prepare independent parameters for each block
+        var generatedCode = [DeclSyntax]()
         
-        // Get list of arguments that given with `@Injected(...)` attribute
-        guard let labeledList = attribute.arguments?.as(LabeledExprListSyntax.self) else {
-            return arguments
-        }
+        // 1. Add `Dependencies` structure to define all properties automatically
+        let dependenciesInit = "\(access) init(\n\(dependencies.initParameters)\n) { \(dependencies.initAssignments) }"
+        let dependenciesStruct = "\(access) struct Dependencies { \(dependencies.variables)\n\(dependenciesInit) }"
+        generatedCode.append("\(raw: dependenciesStruct)")
         
-        // Map each given attribute to modify arguments
-        labeledList.forEach { syntax in
-            switch syntax.label?.text {
-            case "name":
-                modifyVariableName(expression: syntax.expression, arguments: &arguments)
-            
-            case "escaping":
-                modifyVariableEscaping(expression: syntax.expression, arguments: &arguments)
-                
-            default:
-                break
-            }
-        }
+        // 2. Add a required `dependencies` property
+        generatedCode.append("private let dependencies: Dependencies")
         
-        return arguments
-    }
-}
-
-// MARK: Extensions
-
-extension ExprSyntax {
-    func getBoolLiteral() -> Bool? {
-        guard case .keyword(let keyword) = self.as(BooleanLiteralExprSyntax.self)?.literal.tokenKind else { return nil }
-        
-        switch keyword {
-        case .true:
-            return true
-            
-        case .false:
-            return false
-            
-        default:
-            return nil
-        }
+        return generatedCode
     }
 }
